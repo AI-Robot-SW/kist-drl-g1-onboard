@@ -5,22 +5,24 @@ Subscriptions:
 - /onboard/cmd/vel (Twist)          → velocity_buf → LocoClient.Move
 - /onboard/cmd/loco (LocoCommand)   LocoClient FSM dispatch (no buffer)
 - /onboard/safety/estop (EstopFlag) E-STOP DDS context
-- /onboard/cmd/arm (JointCmd)       → rt/arm_sdk  (arm + waist, weight respected)
-- /onboard/cmd/low (JointCmd)       → rt/arm_sdk  (same path; low-level whole-body)
+- /onboard/cmd/arm (JointCmd)       → rt/arm_sdk  (upper body only)
+- /onboard/cmd/low (JointCmd)       → rt/lowcmd   (whole-body direct control)
 - POSIX SHM byte 'safety_flag'      zero-latency E-STOP poll
 
 Publications:
 - /onboard/motor/buf_state (BufState)  telemetry → comm_bridge → PC
-- rt/arm_sdk (LowCmd_)                 Unitree SDK arm joint control
+- rt/arm_sdk (LowCmd_)                 Unitree SDK upper-body control
+- rt/lowcmd  (LowCmd_)                 Unitree SDK whole-body low-level control
 
-Arm SDK path:
-  JointCmd arrives on /onboard/cmd/arm or /onboard/cmd/low.
+Arm SDK path (/onboard/cmd/arm):
   joint_names (no _joint suffix) are mapped to Unitree G1 motor indices 0-28.
   motor_cmd[29].q = 1 enables arm_sdk mode in the G1 loco SDK.
-  CRC is appended before each Write().
 
-Safety monitor is bypassed (safety_monitor_node is a stub). All JointCmd
-messages are dispatched directly to rt/arm_sdk.
+Low cmd path (/onboard/cmd/low):
+  All 29 joints published to rt/lowcmd. Loco SDK balance is bypassed;
+  the planner trajectory must maintain balance internally.
+
+Safety monitor is bypassed (safety_monitor_node is a stub).
 """
 import gc
 from multiprocessing import shared_memory
@@ -170,6 +172,7 @@ class MotorControllerNode(Node):
         self._dds_estop = False
         self._tick_count = 0
         self._arm_sdk_pub: ChannelPublisher | None = None
+        self._lowcmd_pub: ChannelPublisher | None = None
 
         self._loco = self._init_sdk()
 
@@ -178,7 +181,7 @@ class MotorControllerNode(Node):
         self.create_subscription(LocoCommand, '/onboard/cmd/loco', self._on_cmd_loco, _RELIABLE_QOS)
         self.create_subscription(EstopFlag, '/onboard/safety/estop', self._on_estop, _RELIABLE_QOS)
         self.create_subscription(JointCmd, '/onboard/cmd/arm', self._on_joint_cmd, _RELIABLE_QOS)
-        self.create_subscription(JointCmd, '/onboard/cmd/low', self._on_joint_cmd, _RELIABLE_QOS)
+        self.create_subscription(JointCmd, '/onboard/cmd/low', self._on_low_cmd, _RELIABLE_QOS)
 
         period = 1.0 / (self._control_rate_hz if self._control_rate_hz > 0 else 100)
         self._control_period = period
@@ -206,6 +209,10 @@ class MotorControllerNode(Node):
             self._arm_sdk_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
             self._arm_sdk_pub.Init()
             self.get_logger().info('arm_sdk publisher initialized on rt/arm_sdk')
+
+            self._lowcmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
+            self._lowcmd_pub.Init()
+            self.get_logger().info('lowcmd publisher initialized on rt/lowcmd')
 
             return loco
         except Exception as e:
@@ -270,6 +277,38 @@ class MotorControllerNode(Node):
 
         low_cmd.crc = _hg_lowcmd_crc(low_cmd)
         self._arm_sdk_pub.Write(low_cmd)
+
+    def _on_low_cmd(self, msg: JointCmd) -> None:
+        """Whole-body low-level control via rt/lowcmd — loco SDK balance bypassed."""
+        estop = bool(self._shm.buf[0]) or self._dds_estop
+        if estop:
+            return
+
+        if self._lowcmd_pub is None:
+            self.get_logger().debug('[dry] low_cmd received, lowcmd not initialized')
+            return
+
+        low_cmd = unitree_hg_msg_dds__LowCmd_()
+
+        n = len(msg.joint_names)
+        unknown = []
+        for i in range(n):
+            name = msg.joint_names[i]
+            idx = _JOINT_TO_IDX.get(name)
+            if idx is None:
+                unknown.append(name)
+                continue
+            low_cmd.motor_cmd[idx].q      = float(msg.q[i])
+            low_cmd.motor_cmd[idx].dq     = float(msg.dq[i]) if msg.dq else 0.0
+            low_cmd.motor_cmd[idx].kp     = float(msg.kp[i]) if msg.kp else 0.0
+            low_cmd.motor_cmd[idx].kd     = float(msg.kd[i]) if msg.kd else 0.0
+            low_cmd.motor_cmd[idx].tau    = float(msg.tau_ff[i]) if msg.tau_ff else 0.0
+
+        if unknown:
+            self.get_logger().warn(f'unknown joint names in JointCmd: {unknown}')
+
+        low_cmd.crc = _hg_lowcmd_crc(low_cmd)
+        self._lowcmd_pub.Write(low_cmd)
 
     # --- control loop ---
     def _control_loop(self) -> None:
