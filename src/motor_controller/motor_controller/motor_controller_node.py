@@ -37,10 +37,10 @@ from g1_onboard_msgs.msg import BufState, EstopFlag, JointCmd, JointCmdChunk, Lo
 import struct
 
 import unitree_sdk2py.core.channel as _sdk_ch
-from unitree_sdk2py.core.channel import ChannelFactory, ChannelPublisher
+from unitree_sdk2py.core.channel import ChannelFactory, ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
 
 from .action_queue import ActionQueue, VelocityCommand
 from .queue_aggregate import crossfade  # noqa: F401
@@ -173,6 +173,7 @@ class MotorControllerNode(Node):
         self._tick_count = 0
         self._arm_sdk_pub: ChannelPublisher | None = None
         self._lowcmd_pub: ChannelPublisher | None = None
+        self._mode_machine: int = 0
 
         self._loco = self._init_sdk()
 
@@ -213,6 +214,10 @@ class MotorControllerNode(Node):
             self._lowcmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
             self._lowcmd_pub.Init()
             self.get_logger().info('lowcmd publisher initialized on rt/lowcmd')
+
+            self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+            self._lowstate_sub.Init(self._on_lowstate, 10)
+            self.get_logger().info('lowstate subscriber initialized on rt/lowstate')
 
             return loco
         except Exception as e:
@@ -278,6 +283,10 @@ class MotorControllerNode(Node):
         low_cmd.crc = _hg_lowcmd_crc(low_cmd)
         self._arm_sdk_pub.Write(low_cmd)
 
+    def _on_lowstate(self, msg: LowState_) -> None:
+        """Cache mode_machine from hardware for use in lowcmd messages."""
+        self._mode_machine = msg.mode_machine
+
     def _on_low_cmd(self, msg: JointCmd) -> None:
         """Whole-body low-level control via rt/lowcmd — loco SDK balance bypassed."""
         estop = bool(self._shm.buf[0]) or self._dds_estop
@@ -289,6 +298,8 @@ class MotorControllerNode(Node):
             return
 
         low_cmd = unitree_hg_msg_dds__LowCmd_()
+        low_cmd.mode_pr = 0  # Series PR (standard G1 ankle)
+        low_cmd.mode_machine = self._mode_machine
 
         n = len(msg.joint_names)
         unknown = []
@@ -298,6 +309,7 @@ class MotorControllerNode(Node):
             if idx is None:
                 unknown.append(name)
                 continue
+            low_cmd.motor_cmd[idx].mode   = 1
             low_cmd.motor_cmd[idx].q      = float(msg.q[i])
             low_cmd.motor_cmd[idx].dq     = float(msg.dq[i]) if msg.dq else 0.0
             low_cmd.motor_cmd[idx].kp     = float(msg.kp[i]) if msg.kp else 0.0
