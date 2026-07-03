@@ -1,12 +1,10 @@
 """
-100 Hz control loop driving the G1 SDK (REQ-34) [TASK-34].
+Joint command passthrough — rt/arm_sdk and rt/lowcmd paths.
 
 Subscriptions:
-- /onboard/cmd/vel (Twist)          → velocity_buf → LocoClient.Move
-- /onboard/cmd/loco (LocoCommand)   LocoClient FSM dispatch (no buffer)
 - /onboard/safety/estop (EstopFlag) E-STOP DDS context
 - /onboard/cmd/arm (JointCmd)       → rt/arm_sdk  (upper body only)
-- /onboard/cmd/low (JointCmd)       → rt/lowcmd   (whole-body direct control)
+- /onboard/cmd/low (JointCmd)       → rt/lowcmd   (whole-body, GearSonic planner)
 - POSIX SHM byte 'safety_flag'      zero-latency E-STOP poll
 
 Publications:
@@ -16,34 +14,28 @@ Publications:
 
 Arm SDK path (/onboard/cmd/arm):
   joint_names (no _joint suffix) are mapped to Unitree G1 motor indices 0-28.
-  motor_cmd[29].q = 1 enables arm_sdk mode in the G1 loco SDK.
+  motor_cmd[29].q = 1 enables arm_sdk mode.
 
 Low cmd path (/onboard/cmd/low):
-  All 29 joints published to rt/lowcmd. Loco SDK balance is bypassed;
-  the planner trajectory must maintain balance internally.
+  All 29 joints published to rt/lowcmd. Balance is the planner's responsibility.
+  mode_machine is mirrored from rt/lowstate. mode_pr = 0 (Series PR).
 
-Safety monitor is bypassed (safety_monitor_node is a stub).
+LocoClient removed — whole-body control via rt/lowcmd only.
 """
 import gc
+import struct
 from multiprocessing import shared_memory
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Twist
-from g1_onboard_msgs.msg import BufState, EstopFlag, JointCmd, JointCmdChunk, LocoCommand
-
-import struct
+from g1_onboard_msgs.msg import BufState, EstopFlag, JointCmd
 
 import unitree_sdk2py.core.channel as _sdk_ch
 from unitree_sdk2py.core.channel import ChannelFactory, ChannelPublisher, ChannelSubscriber
-from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
-
-from .action_queue import ActionQueue, VelocityCommand
-from .queue_aggregate import crossfade  # noqa: F401
 
 # Pure-Python CRC32 for HG LowCmd_ — avoids crc_aarch64.so dependency.
 # Matches CRC.__PackHGLowCmd + CRC._crc_py from unitree_sdk2py.
@@ -79,17 +71,6 @@ _RELIABLE_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
 )
-
-# LocoCommand.action → LocoClient method name.
-_LOCO_METHOD = {
-    LocoCommand.ACTION_DAMP:          'Damp',
-    LocoCommand.ACTION_ZERO_TORQUE:   'ZeroTorque',
-    LocoCommand.ACTION_STAND_UP:      'Lie2StandUp',
-    LocoCommand.ACTION_BALANCE_STAND: 'BalanceStand',
-    LocoCommand.ACTION_LOW_STAND:     'LowStand',
-    LocoCommand.ACTION_HIGH_STAND:    'HighStand',
-    LocoCommand.ACTION_SIT_DOWN:      'Sit',
-}
 
 # Joint name (no _joint suffix) → Unitree G1 motor index (matches MuJoCo order).
 _JOINT_TO_IDX: dict[str, int] = {
@@ -153,59 +134,40 @@ class MotorControllerNode(Node):
             'motor_controller',
             automatically_declare_parameters_from_overrides=True,
         )
-        self._control_rate_hz: int = self.get_parameter('control_rate_hz').value
-        self._ring_slots: int = self.get_parameter('ring_buffer_slots').value
-        self._estop_loco_action: str = self.get_parameter('estop_loco_action').value
         self._network_interface: str = self.get_parameter('network_interface').value
         self._domain_id: int = self.get_parameter('domain_id').value
         self._estop_shm_name: str = self.get_parameter('estop_shm_name').value
         self._dry_run: bool = self.get_parameter('dry_run').value
         self._buf_state_rate_hz: float = self.get_parameter('buf_state_rate_hz').value
 
-        if not hasattr(LocoClient, self._estop_loco_action):
-            raise RuntimeError(
-                f'estop_loco_action {self._estop_loco_action!r} is not a LocoClient method')
-
-        self._queue = ActionQueue(slots=self._ring_slots)
         self._shm = self._open_shm(self._estop_shm_name)
-        self._estop_active = False
         self._dds_estop = False
-        self._tick_count = 0
         self._arm_sdk_pub: ChannelPublisher | None = None
         self._lowcmd_pub: ChannelPublisher | None = None
         self._mode_machine: int = 0
 
-        self._loco = self._init_sdk()
+        self._init_sdk()
 
         self._buf_pub = self.create_publisher(BufState, '/onboard/motor/buf_state', _RELIABLE_QOS)
-        self.create_subscription(Twist, '/onboard/cmd/vel', self._on_cmd_vel, _RELIABLE_QOS)
-        self.create_subscription(LocoCommand, '/onboard/cmd/loco', self._on_cmd_loco, _RELIABLE_QOS)
         self.create_subscription(EstopFlag, '/onboard/safety/estop', self._on_estop, _RELIABLE_QOS)
         self.create_subscription(JointCmd, '/onboard/cmd/arm', self._on_joint_cmd, _RELIABLE_QOS)
         self.create_subscription(JointCmd, '/onboard/cmd/low', self._on_low_cmd, _RELIABLE_QOS)
 
-        period = 1.0 / (self._control_rate_hz if self._control_rate_hz > 0 else 100)
-        self._control_period = period
-        self.create_timer(period, self._control_loop)
         bs = self._buf_state_rate_hz if self._buf_state_rate_hz > 0 else 10.0
-        self._buf_state_period = 1.0 / bs
-        self.create_timer(self._buf_state_period, self._publish_buf_state)
+        self.create_timer(1.0 / bs, self._publish_buf_state)
 
         self.get_logger().info(
-            f'motor_controller ready ({self._control_rate_hz}Hz, slots={self._ring_slots}, '
-            f'estop_action={self._estop_loco_action}, dry_run={self._loco is None}, '
-            f'arm_sdk={"enabled" if self._arm_sdk_pub is not None else "dry"})')
+            f'motor_controller ready (dry_run={self._dry_run}, '
+            f'arm_sdk={"enabled" if self._arm_sdk_pub is not None else "dry"}, '
+            f'lowcmd={"enabled" if self._lowcmd_pub is not None else "dry"})')
 
-    def _init_sdk(self) -> LocoClient | None:
+    def _init_sdk(self) -> None:
         if self._dry_run:
             self.get_logger().warn('dry_run=true — SDK disabled, dispatch logs only')
-            return None
+            return
         try:
             _patch_channel_factory()
             ChannelFactory().Init(self._domain_id, self._network_interface)
-            loco = LocoClient()
-            loco.SetTimeout(10.0)
-            loco.Init()
 
             self._arm_sdk_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
             self._arm_sdk_pub.Init()
@@ -219,10 +181,8 @@ class MotorControllerNode(Node):
             self._lowstate_sub.Init(self._on_lowstate, 10)
             self.get_logger().info('lowstate subscriber initialized on rt/lowstate')
 
-            return loco
         except Exception as e:
             self.get_logger().error(f'SDK init failed ({e}) — falling back to dry_run')
-            return None
 
     def _open_shm(self, name: str) -> shared_memory.SharedMemory:
         try:
@@ -232,30 +192,17 @@ class MotorControllerNode(Node):
             shm.buf[0] = 0
         return shm
 
-    # --- producers (subscriptions) ---
-    def _on_cmd_vel(self, twist: Twist) -> None:
-        self._queue.push_velocity(VelocityCommand(twist=twist))
-
-    def _on_cmd_loco(self, msg: LocoCommand) -> None:
-        name = _LOCO_METHOD.get(msg.action)
-        if name is None:
-            self.get_logger().warn(f'unknown loco action {msg.action}')
-            return
-        if self._loco is None:
-            self.get_logger().info(f'[dry] loco {name}(param={msg.param})')
-            return
-        fn = getattr(self._loco, name)
-        fn(msg.param) if msg.action == LocoCommand.ACTION_BALANCE_STAND else fn()
-
     def _on_estop(self, flag: EstopFlag) -> None:
         self._dds_estop = flag.active
 
-    def _on_joint_cmd(self, msg: JointCmd) -> None:
-        """Direct arm_sdk publish — safety_monitor bypassed (stub)."""
-        estop = bool(self._shm.buf[0]) or self._dds_estop
-        if estop:
-            return
+    def _on_lowstate(self, msg: LowState_) -> None:
+        """Cache mode_machine from hardware for use in lowcmd messages."""
+        self._mode_machine = msg.mode_machine
 
+    def _on_joint_cmd(self, msg: JointCmd) -> None:
+        """Upper-body control via rt/arm_sdk."""
+        if bool(self._shm.buf[0]) or self._dds_estop:
+            return
         if self._arm_sdk_pub is None:
             self.get_logger().debug('[dry] joint_cmd received, arm_sdk not initialized')
             return
@@ -263,36 +210,28 @@ class MotorControllerNode(Node):
         low_cmd = unitree_hg_msg_dds__LowCmd_()
         low_cmd.motor_cmd[_ARM_SDK_ENABLE_IDX].q = 1.0  # enable arm_sdk
 
-        n = len(msg.joint_names)
         unknown = []
-        for i in range(n):
-            name = msg.joint_names[i]
+        for i, name in enumerate(msg.joint_names):
             idx = _JOINT_TO_IDX.get(name)
             if idx is None:
                 unknown.append(name)
                 continue
-            low_cmd.motor_cmd[idx].q      = float(msg.q[i])
-            low_cmd.motor_cmd[idx].dq     = float(msg.dq[i]) if msg.dq else 0.0
-            low_cmd.motor_cmd[idx].kp     = float(msg.kp[i]) if msg.kp else 0.0
-            low_cmd.motor_cmd[idx].kd     = float(msg.kd[i]) if msg.kd else 0.0
-            low_cmd.motor_cmd[idx].tau    = float(msg.tau_ff[i]) if msg.tau_ff else 0.0
+            low_cmd.motor_cmd[idx].q   = float(msg.q[i])
+            low_cmd.motor_cmd[idx].dq  = float(msg.dq[i]) if msg.dq else 0.0
+            low_cmd.motor_cmd[idx].kp  = float(msg.kp[i]) if msg.kp else 0.0
+            low_cmd.motor_cmd[idx].kd  = float(msg.kd[i]) if msg.kd else 0.0
+            low_cmd.motor_cmd[idx].tau = float(msg.tau_ff[i]) if msg.tau_ff else 0.0
 
         if unknown:
-            self.get_logger().warn(f'unknown joint names in JointCmd: {unknown}')
+            self.get_logger().warn(f'unknown joint names: {unknown}')
 
         low_cmd.crc = _hg_lowcmd_crc(low_cmd)
         self._arm_sdk_pub.Write(low_cmd)
 
-    def _on_lowstate(self, msg: LowState_) -> None:
-        """Cache mode_machine from hardware for use in lowcmd messages."""
-        self._mode_machine = msg.mode_machine
-
     def _on_low_cmd(self, msg: JointCmd) -> None:
-        """Whole-body low-level control via rt/lowcmd — loco SDK balance bypassed."""
-        estop = bool(self._shm.buf[0]) or self._dds_estop
-        if estop:
+        """Whole-body control via rt/lowcmd — planner trajectory."""
+        if bool(self._shm.buf[0]) or self._dds_estop:
             return
-
         if self._lowcmd_pub is None:
             self.get_logger().debug('[dry] low_cmd received, lowcmd not initialized')
             return
@@ -301,66 +240,28 @@ class MotorControllerNode(Node):
         low_cmd.mode_pr = 0  # Series PR (standard G1 ankle)
         low_cmd.mode_machine = self._mode_machine
 
-        n = len(msg.joint_names)
         unknown = []
-        for i in range(n):
-            name = msg.joint_names[i]
+        for i, name in enumerate(msg.joint_names):
             idx = _JOINT_TO_IDX.get(name)
             if idx is None:
                 unknown.append(name)
                 continue
-            low_cmd.motor_cmd[idx].mode   = 1
-            low_cmd.motor_cmd[idx].q      = float(msg.q[i])
-            low_cmd.motor_cmd[idx].dq     = float(msg.dq[i]) if msg.dq else 0.0
-            low_cmd.motor_cmd[idx].kp     = float(msg.kp[i]) if msg.kp else 0.0
-            low_cmd.motor_cmd[idx].kd     = float(msg.kd[i]) if msg.kd else 0.0
-            low_cmd.motor_cmd[idx].tau    = float(msg.tau_ff[i]) if msg.tau_ff else 0.0
+            low_cmd.motor_cmd[idx].mode = 1
+            low_cmd.motor_cmd[idx].q   = float(msg.q[i])
+            low_cmd.motor_cmd[idx].dq  = float(msg.dq[i]) if msg.dq else 0.0
+            low_cmd.motor_cmd[idx].kp  = float(msg.kp[i]) if msg.kp else 0.0
+            low_cmd.motor_cmd[idx].kd  = float(msg.kd[i]) if msg.kd else 0.0
+            low_cmd.motor_cmd[idx].tau = float(msg.tau_ff[i]) if msg.tau_ff else 0.0
 
         if unknown:
-            self.get_logger().warn(f'unknown joint names in JointCmd: {unknown}')
+            self.get_logger().warn(f'unknown joint names: {unknown}')
 
         low_cmd.crc = _hg_lowcmd_crc(low_cmd)
         self._lowcmd_pub.Write(low_cmd)
 
-    # --- control loop ---
-    def _control_loop(self) -> None:
-        self._tick_count += 1
-        estop = bool(self._shm.buf[0]) or self._dds_estop
-        if estop and not self._estop_active:
-            self._enter_estop()
-        self._estop_active = estop
-        if estop:
-            return
-        vc = self._queue.pop_velocity()
-        if vc is not None:
-            self._loco_move(vc.twist)
-
-    def _loco_move(self, twist: Twist) -> None:
-        vx, vy, vyaw = twist.linear.x, twist.linear.y, twist.angular.z
-        if self._loco is None:
-            self.get_logger().info(f'[dry] Move({vx:.2f},{vy:.2f},{vyaw:.2f})')
-            return
-        self._loco.Move(vx, vy, vyaw, True)
-
-    def _enter_estop(self) -> None:
-        self._queue.flush()
-        self.get_logger().warn(f'E-STOP — flush + LocoClient.{self._estop_loco_action}()')
-        if self._loco is not None:
-            getattr(self._loco, self._estop_loco_action)()
-
-    # --- telemetry ---
     def _publish_buf_state(self) -> None:
-        vfill, jfill = self._queue.fill_ratio()
-        measured = self._tick_count / self._buf_state_period
-        self._tick_count = 0
         msg = BufState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.velocity_fill = vfill
-        msg.joint_fill = jfill
-        msg.control_rate_hz = float(measured)
-        msg.last_cmd_age_ms = 0
-        msg.underrun_count = self._queue.underrun_count
-        msg.overrun_count = self._queue.overrun_count
         self._buf_pub.publish(msg)
 
     def destroy_node(self) -> None:
