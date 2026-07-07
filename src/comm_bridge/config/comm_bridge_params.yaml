@@ -101,11 +101,11 @@ inbound_relay:
     relays:
       - src:  "/bridge/cmd/arm"
         dst:  "/onboard/cmd/arm"
-        type: "g1_onboard_msgs/msg/JointCmd"
+        type: "g1_onboard_msgs/msg/JointCmdChunk"   # chunk-as-wire (2026-05-26 canonical, ICD IF-50); NX motor_controller unpacks -> 100 Hz
         qos:  "reliable"
       - src:  "/bridge/cmd/low"
         dst:  "/onboard/cmd/low"
-        type: "g1_onboard_msgs/msg/JointCmd"
+        type: "g1_onboard_msgs/msg/JointCmdChunk"   # chunk-as-wire (pairs with /bridge/cmd/arm); rt/lowcmd path
         qos:  "reliable"
         # 2026-05-22: low-level VLA whole-body wire (rt/lowcmd path, weight
         # ignored). Pairs with /bridge/cmd/arm (rt/arm_sdk, weight respected).
