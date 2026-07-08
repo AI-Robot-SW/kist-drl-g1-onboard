@@ -121,7 +121,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Do not use --no-build-isolation for Python cyclonedds later.
 # -----------------------------------------------------------------------------
 RUN python3 -m pip install --upgrade pip wheel && \
-    python3 -m pip install --force-reinstall "setuptools==59.6.0"
+    python3 -m pip install --force-reinstall "setuptools==59.6.0" "numpy==1.26.4"
 
 # -----------------------------------------------------------------------------
 # Build C/C++ CycloneDDS for Python cyclonedds / Unitree SDK2PY
