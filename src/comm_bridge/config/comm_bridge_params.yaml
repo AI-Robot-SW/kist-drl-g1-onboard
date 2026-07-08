@@ -128,3 +128,7 @@ inbound_relay:
         dst:  "/onboard/audio/playback"
         type: "g1_onboard_msgs/msg/AudioPCM"
         qos:  "reliable"
+      - src:  "/bridge/cmd/probe"
+        dst:  "/onboard/cmd/probe"
+        type: "g1_onboard_msgs/msg/JointCmd"
+        qos:  "reliable"
