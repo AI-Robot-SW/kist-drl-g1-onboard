@@ -12,6 +12,11 @@ ROS_DISTRO=${ROS_DISTRO:-humble}
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Ensure the shared g1_onboard_msgs submodule is materialised before building.
+# A submodule is a pinned pointer; a fresh clone (or a pin bump) leaves its dir
+# empty/stale until inited, which would make colcon find 0 packages.
+git submodule update --init --recursive
+
 if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
   # ROS setup references unset vars (AMENT_TRACE_SETUP_FILES)
   set +u

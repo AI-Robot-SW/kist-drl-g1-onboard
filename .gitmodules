@@ -1,0 +1,3 @@
+[submodule "src/g1_onboard_msgs"]
+	path = src/g1_onboard_msgs
+	url = https://github.com/Safety-Node/kist-drl-g1-msgs.git
