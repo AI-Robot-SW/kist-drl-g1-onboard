@@ -28,7 +28,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+        with:
+          submodules: recursive
       # ----------------------------------------------------------------
       # Caches -- typical wall-clock impact on a hit:
       #   apt cache       ~60s saved (skip re-downloading .deb files)
